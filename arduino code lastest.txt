@@ -1,0 +1,211 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <NewPing.h>
+
+// Define pins and constants
+#define TRIG_PIN 9 // Pin connected to Trig of ultrasonic sensor
+#define ECHO_PIN 10 // Pin connected to Echo of ultrasonic sensor
+#define MAX_DISTANCE 300 // Maximum distance for ultrasonic sensor (in cm)
+
+#define RAIN_SENSOR_DIGITAL_PIN 6 // Digital pin for rain detection
+#define RAIN_SENSOR_ANALOG_PIN A3 // Analog pin for rain status checking
+
+#define SENSOR_HEIGHT 300 // Height of the sensor from the water surface (in cm)
+
+const float MAX_CHANGE_RATE = 50.0; // Maximum acceptable rate of change in cm per second
+const unsigned long STABLE_THRESHOLD_TIME = 60000; // 1 minute stability threshold
+
+// Initialize the LCD with I2C address 0x27 and a 16x2 display
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Initialize the ultrasonic sensor
+NewPing sonar(TRIG_PIN, ECHO_PIN, MAX_DISTANCE);
+
+float currentWaterLevel = 0;
+float previousWaterLevel = 0;
+unsigned long levelStableTime = 0;
+unsigned long lastReadingTime = 0;
+
+bool wasRaining = false;
+unsigned long rainStartTime = 0;
+bool rainMessageShown = false;
+bool rainSensorAnalogOK = true; // Declare this variable
+
+void setup() {
+  Serial.begin(9600); // Initialize serial communication
+  lcd.init(); // Initialize the LCD
+  lcd.backlight(); // Turn on the backlight
+  lcd.clear(); // Clear the screen
+  lcd.setCursor(0, 0);
+  lcd.print("Flood Monitoring"); // Display initial message
+  delay(2000); // Pause to show the initial message
+  lcd.clear();
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(RAIN_SENSOR_DIGITAL_PIN, INPUT_PULLUP); // Digital rain sensor
+  pinMode(RAIN_SENSOR_ANALOG_PIN, INPUT); // Analog rain sensor
+}
+
+void loop() {
+  checkUltrasonicSensor();
+  checkRainSensorDigital();
+  checkRainSensorAnalog();
+  delay(1000); // Delay to avoid rapid refreshing
+}
+
+// Function to check the ultrasonic sensor and update the water level
+void checkUltrasonicSensor() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // Timeout after 30ms
+
+  if (duration > 0) {
+    float distanceToWater = (duration * 0.0343) / 2; // Convert from cm to meters
+    currentWaterLevel = SENSOR_HEIGHT - distanceToWater;
+
+    unsigned long currentTime = millis();
+    unsigned long timeDifference = currentTime - lastReadingTime;
+    float rateOfChange = abs(currentWaterLevel - previousWaterLevel) / (timeDifference / 1000.0);
+    sendToOrangePi("UL:", "active");
+
+    if (rateOfChange > MAX_CHANGE_RATE) {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("False Reading!");
+      lcd.setCursor(0, 1);
+      lcd.print("Ignoring...");
+      
+      Serial.println("False detection due to rapid height change, ignoring data.");
+      
+      delay(2000);
+      return;
+    }
+
+    lastReadingTime = currentTime;
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Level: ");
+    lcd.print(currentWaterLevel / 100); // Convert to meters
+    lcd.print(" m");
+   
+
+    if (currentWaterLevel >= 100 && currentWaterLevel < 200 && previousWaterLevel < 100) {
+      // sendAlert("Water level reached 1 meter!");
+      sendToOrangePi("MS:", "Orange Warning: Waterlevel is at " +  String(currentWaterLevel / 100));
+       sendToOrangePi("WL:", String(currentWaterLevel / 100));
+      lcd.setCursor(0, 1);
+      lcd.print("Reached 1m!");
+    } else if (currentWaterLevel < 100 && previousWaterLevel >= 100) {
+      // sendAlert("Water level dropped below 1 meter!");
+      sendToOrangePi("MS:", " Waterlevel dropped  at " +  String(currentWaterLevel / 100));
+       sendToOrangePi("WL:", String(currentWaterLevel / 100));
+      lcd.setCursor(0, 1);
+      lcd.print("Below 1m!");
+    } else if (currentWaterLevel >= 200 && previousWaterLevel < 200) {
+      // sendAlert("Water level reached 2 meters!");
+      sendToOrangePi("MS:", "Red Warning: Waterlevel is at " +  String(currentWaterLevel / 100));
+       sendToOrangePi("WL:", String(currentWaterLevel / 100));
+      lcd.setCursor(0, 1);
+      lcd.print("Reached 2m!");
+    } else if (currentWaterLevel < 200 && previousWaterLevel >= 200) {
+      // sendAlert("Water level dropped below 2 meters!");
+      sendToOrangePi("MS:", "Waterlevel is dropped at " +  String(currentWaterLevel / 100));
+       sendToOrangePi("WL:", String(currentWaterLevel / 100));
+      lcd.setCursor(0, 1);
+      lcd.print("Below 2m!");
+    }
+
+    if (currentWaterLevel >= 100 && (millis() - levelStableTime >= STABLE_THRESHOLD_TIME)) {
+      // sendAlert("Water level stable at 1 meter for 1 minute!");
+      levelStableTime = millis();
+    } else if (currentWaterLevel != previousWaterLevel) {
+      levelStableTime = millis();
+    }
+
+    previousWaterLevel = currentWaterLevel;
+  } else {
+    Serial.println("Ultrasonic disconnected.");
+    sendToOrangePi("UL:", "inactive");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Ultrasonic Fail");
+    delay(1000);
+  }
+}
+
+// Function to check the digital rain sensor
+void checkRainSensorDigital() {
+  bool isRaining = digitalRead(RAIN_SENSOR_DIGITAL_PIN) == LOW;
+
+  if (isRaining && !wasRaining) {
+    wasRaining = true;
+    rainStartTime = millis();
+    Serial.println("Rain started.");
+    displayRainMessage("Rain Started.");
+    sendToOrangePi("RS (Digital):", "Rain Started");
+  } else if (!isRaining && wasRaining) {
+    wasRaining = false;
+    unsigned long rainDuration = millis() - rainStartTime;
+    Serial.print("RF:");
+    Serial.println(rainDuration / 1000);
+    displayRainMessage("RF:" + String(rainDuration / 1000) + "s");
+    sendToOrangePi("RF:", String(rainDuration / 1000));
+  }
+}
+
+// Function to check the analog rain sensor
+void checkRainSensorAnalog() {
+  int analogValue = analogRead(RAIN_SENSOR_ANALOG_PIN);
+
+  if (analogValue == 1023) {
+    rainSensorAnalogOK = false; // This is now declared
+    Serial.println("Analog Sensor Disconnected");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Rain Anlg. Fail");
+    delay(1000);
+    sendToOrangePi("RS (Analog):", "inactive");
+  } else {
+    rainSensorAnalogOK = true; // This is now declared
+    Serial.print("Analog Sensor Value: ");
+    Serial.println(analogValue);
+    Serial.println("Rain Sensor (Analog): Active");
+    sendToOrangePi("RS (Analog):", "active");
+  }
+}
+
+// Function to display rain messages temporarily
+void displayRainMessage(String message) {
+  rainMessageShown = true;
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(message);
+  delay(1000); // Display the message for 1 second
+  rainMessageShown = false;
+}
+
+// Function to send formatted data to the Orange Pi One
+void sendToOrangePi(String messageType, String value) {
+  Serial.print(messageType);
+  Serial.println(value);
+}
+
+// Function to simulate sending an SMS alert
+// void sendAlert(String message) {
+//   Serial.println("Sending SMS...");
+//   Serial.println("SMS Content: " + message);
+//   Serial.println("SMS Sent!");
+//   lcd.clear();
+//   lcd.setCursor(0, 1);
+//   lcd.print("SMS Sent!");
+//   lcd.setCursor(0, 0);
+//   lcd.print(message.substring(0, 16));
+//   delay(2000);
+// }
